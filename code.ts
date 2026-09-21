@@ -27,6 +27,40 @@ const CLASS_EXPORTED_COLLECTIONS = new Set(["Color-categorical"]);
 // theme block would resolve with the default mode for the whole tree.
 const classExportedAliases = new Map<string, Map<string, Variable>>();
 
+// Primitive collections: a Palette token that resolves into one keeps a var()
+// reference to the primitive, and the primitive is emitted in the same theme
+// block, so a consumer overrides one ramp per theme instead of every token.
+const PRIMITIVE_COLLECTION_PREFIX = "Color-primitives-";
+
+type PrimitiveRef = {
+  kind: "primitive";
+  variable: Variable;
+  collection: VariableCollection;
+  literal: VariableValue;
+};
+
+function isPrimitiveRef(value: unknown): value is PrimitiveRef {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as PrimitiveRef).kind === "primitive"
+  );
+}
+
+// "Day/Neutral/700" in the day block -> --primitive-neutral-700: the block's
+// own theme is already its selector. A block also reaches into another
+// theme's primitives (night uses Dusk/Blue/200), and those keep the theme so
+// the two 200s do not collide. The prefix keeps the names clear of the
+// Palette's own --base-* ramps.
+function primitiveCssName(variable: Variable, collection: VariableCollection, blockTheme: string): string {
+  const theme = collection.name.slice(PRIMITIVE_COLLECTION_PREFIX.length).toLowerCase();
+  const parts = variable.name.split("/");
+  if (parts.length > 1 && parts[0].toLowerCase() === theme && theme === blockTheme) {
+    parts.shift();
+  }
+  return "--primitive-" + rename(parts.join("/")).slice(2);
+}
+
 // This provides the callback to generate the code.
 function rename(name: string): string {
   let o = name
@@ -161,8 +195,8 @@ async function generateColorVariableMap(
 }
 
 async function followVariableReferences(
-  value: VariableValue | null | undefined, allVariables: Variable[], allCollections: (VariableCollection | null)[], paletteCollection: VariableCollection, mode: { modeId: string; name: string }, variableModes: Record<string, string>
-) : Promise<VariableValue | null | undefined>  {
+  value: VariableValue | null | undefined, allVariables: Variable[], allCollections: (VariableCollection | null)[], paletteCollection: VariableCollection, mode: { modeId: string; name: string }, variableModes: Record<string, string>, keepPrimitives = false
+) : Promise<VariableValue | PrimitiveRef | null | undefined>  {
     if (value === null || value === undefined) {
       console.warn("Value is null or undefined", value);
       return null;
@@ -180,55 +214,61 @@ async function followVariableReferences(
           }
         }
         if (aliasVariable.variableCollectionId === paletteCollection.id) {
-          value = aliasVariable.valuesByMode[mode.modeId];
-          value = await followVariableReferences(value, allVariables, allCollections, paletteCollection, mode, variableModes);
-        } else {
-          let collection = allCollections.find(
-            (c) => c?.id === aliasVariable.variableCollectionId
-          );
-          if (!collection) {
-             collection = await figma.variables.getVariableCollectionByIdAsync(aliasVariable.variableCollectionId);
-             if (!collection) {
-               console.info(
-                 "Collection not found",
-                 aliasVariable.variableCollectionId
-               );
-               return null
-             }
-             console.log("Collection found", collection.name, collection.modes);
-            allCollections.push(collection);
-          }
-          let collectionMode: { modeId: string; name: string } | undefined;
-          if (collection.modes.length === 1) {
-            collectionMode = collection.modes[0];
-          } else if (CLASS_EXPORTED_COLLECTIONS.has(collection.name)) {
-            return value;
-          } else if (collection.id in variableModes) {
-            const modeId = variableModes[collection.id];
-            collectionMode = collection.modes.find(m => m.modeId === modeId);
-          } else if (collection.name in VariableModes) {
-            collectionMode = collection.modes.find(m => m.name === VariableModes[collection.name]);
-          } else {
-            console.warn("Collection mode not found", collection.name, collection.modes);
-            return null
-          }
-          
-          if (!collectionMode) {
-            console.warn("Mode not found", collection.name, collection.modes);
-            return null
-          }
-          value = aliasVariable.valuesByMode[collectionMode.modeId];
-          if (value === null || value === undefined) {
-            console.warn("Value is null or undefined", aliasVariable.name, collectionMode.name);
-            return null;
-          }
-          const out = await followVariableReferences(value, allVariables, allCollections, paletteCollection, mode, variableModes);
-          if (out === null || out === undefined) {
-            console.warn("Follow variable references returned null", aliasVariable.name, mode.name);
-            return null;
-          }
-          value = out;
+          return followVariableReferences(aliasVariable.valuesByMode[mode.modeId], allVariables, allCollections, paletteCollection, mode, variableModes, keepPrimitives);
         }
+        let collection = allCollections.find(
+          (c) => c?.id === aliasVariable.variableCollectionId
+        );
+        if (!collection) {
+           collection = await figma.variables.getVariableCollectionByIdAsync(aliasVariable.variableCollectionId);
+           if (!collection) {
+             console.info(
+               "Collection not found",
+               aliasVariable.variableCollectionId
+             );
+             return null
+           }
+           console.log("Collection found", collection.name, collection.modes);
+          allCollections.push(collection);
+        }
+        let collectionMode: { modeId: string; name: string } | undefined;
+        if (collection.modes.length === 1) {
+          collectionMode = collection.modes[0];
+        } else if (CLASS_EXPORTED_COLLECTIONS.has(collection.name)) {
+          return value;
+        } else if (collection.id in variableModes) {
+          const modeId = variableModes[collection.id];
+          collectionMode = collection.modes.find(m => m.modeId === modeId);
+        } else if (collection.name in VariableModes) {
+          collectionMode = collection.modes.find(m => m.name === VariableModes[collection.name]);
+        } else {
+          console.warn("Collection mode not found", collection.name, collection.modes);
+          return null
+        }
+
+        if (!collectionMode) {
+          console.warn("Mode not found", collection.name, collection.modes);
+          return null
+        }
+        const modeValue = aliasVariable.valuesByMode[collectionMode.modeId];
+        if (modeValue === null || modeValue === undefined) {
+          console.warn("Value is null or undefined", aliasVariable.name, collectionMode.name);
+          return null;
+        }
+        if (keepPrimitives && collection.name.startsWith(PRIMITIVE_COLLECTION_PREFIX)) {
+          const literal = await followVariableReferences(modeValue, allVariables, allCollections, paletteCollection, mode, variableModes, false);
+          if (literal === null || literal === undefined || isPrimitiveRef(literal)) {
+            console.warn("Primitive did not resolve", aliasVariable.name, collectionMode.name);
+            return null;
+          }
+          return { kind: "primitive", variable: aliasVariable, collection, literal };
+        }
+        const out = await followVariableReferences(modeValue, allVariables, allCollections, paletteCollection, mode, variableModes, keepPrimitives);
+        if (out === null || out === undefined) {
+          console.warn("Follow variable references returned null", aliasVariable.name, mode.name);
+          return null;
+        }
+        return out;
       }
       return value;
     }
@@ -273,16 +313,30 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
     if (fixed) {
       out += fixedPalletContent[fixed];
     }
+    const primitives = new Map<string, string>();
+    let declarations = "";
     for (const variable of palletteVariables) {
-      let value: VariableValue | null | undefined = variable.valuesByMode[mode.modeId];
       const name = rename(variable.name);
-      value = await followVariableReferences(value, allVariables, allCollections, paletteCollection, mode, variableModes);
-     
+      const value = await followVariableReferences(variable.valuesByMode[mode.modeId], allVariables, allCollections, paletteCollection, mode, variableModes, true);
 
       if (value === null) {
         console.warn("Variable not found", variable.name, mode.name);
         continue;
       } else if (value === undefined) {
+        continue;
+      }
+
+      if (isPrimitiveRef(value)) {
+        const primitive = primitiveCssName(value.variable, value.collection, cleanName);
+        const literal = value.literal instanceof Object ? rgbaToHexOrColorName(value.literal as Color) : String(value.literal);
+        const known = primitives.get(primitive);
+        if (known !== undefined && known !== literal) {
+          console.warn("Primitive name collision, emitting the literal", primitive, variable.name, mode.name);
+          declarations += "  " + name + ": " + literal + ";\n";
+          continue;
+        }
+        primitives.set(primitive, literal);
+        declarations += "  " + name + ": var(" + primitive + ");\n";
         continue;
       }
 
@@ -298,19 +352,23 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
         }
         continue;
       }
+
       if (!(value instanceof Object)) {
-        out += await value2str(value, name, allVariables);
+        declarations += await value2str(value, name, allVariables);
         continue;
       }
       try {
         const color = rgbaToHexOrColorName(value as Color);
-        out += "  " + name + ": " + color + ";\n";
+        declarations += "  " + name + ": " + color + ";\n";
       } catch (e) {
         console.warn("Error converting color", variable.name, mode.name, value);
         continue;
       }
-      
     }
+    for (const [primitive, literal] of primitives) {
+      out += "  " + primitive + ": " + literal + ";\n";
+    }
+    out += declarations;
     out += "}\n";
   }
   return out;
