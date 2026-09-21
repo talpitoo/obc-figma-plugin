@@ -17,6 +17,10 @@ const VariableModes: Record<string, string> = {
   "dusk-configuration": "v2",
 }
 
+// Collections exported as one CSS class per mode (like Component-size). A Palette
+// token that aliases into one of them keeps the reference, so the class decides.
+const CLASS_EXPORTED_COLLECTIONS = new Set(["Color-categorical"]);
+
 // This provides the callback to generate the code.
 function rename(name: string): string {
   let o = name
@@ -191,9 +195,9 @@ async function followVariableReferences(
           let collectionMode: { modeId: string; name: string } | undefined;
           if (collection.modes.length === 1) {
             collectionMode = collection.modes[0];
-          } else if (collection.name === "Color-categorical") {
-            return undefined;
-          }  else if (collection.id in variableModes) {
+          } else if (CLASS_EXPORTED_COLLECTIONS.has(collection.name)) {
+            return value;
+          } else if (collection.id in variableModes) {
             const modeId = variableModes[collection.id];
             collectionMode = collection.modes.find(m => m.modeId === modeId);
           } else if (collection.name in VariableModes) {
@@ -276,10 +280,10 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
         continue;
       }
 
-      if (!(value instanceof Object)) {
+      if (!(value instanceof Object) || isVariableAlias(value)) {
         out += await value2str(value, name, allVariables);
         continue;
-      } 
+      }
       try {
         const color = rgbaToHexOrColorName(value as Color);
         out += "  " + name + ": " + color + ";\n";
@@ -294,7 +298,7 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
   return out;
 }
 
-async function generateCssSizes(options: {collectionName: string, cssPrefix: string}): Promise<string> {
+async function generateCssSizes(options: {collectionName: string, cssPrefix: string, rootMode: string}): Promise<string> {
   console.log("generate css sizes");
   const allVariables = await figma.variables.getLocalVariablesAsync();
   const collectionIds = allVariables.map((v) => v.variableCollectionId);
@@ -316,7 +320,7 @@ async function generateCssSizes(options: {collectionName: string, cssPrefix: str
   );
   let out = "";
   for (const mode of modes) {
-    if (mode.name.toLowerCase() === "regular") {
+    if (mode.name.toLowerCase() === options.rootMode) {
       out += ":root, ";
     }
     out += options.cssPrefix + mode.name.toLowerCase() + " {\n";
@@ -530,7 +534,7 @@ async function value2str(value: VariableValue | null | undefined, name: string, 
 }
 
 async function generateCssPaletteFromVariabler( event: CodegenEvent): Promise<CodegenResult[]> {
-  let out = await generateCssSizes({collectionName: "Component-size", cssPrefix: ".obc-component-size-"});
+  let out = await generateCssSizes({collectionName: "Component-size", cssPrefix: ".obc-component-size-", rootMode: "regular"});
   out += "* {\n";
   out += await generateCssSizesFixedMode({collectionName: ".typography-primitives", mode: "Regular"});
   out += await generateCssSizesFixedMode({collectionName: "Typography-primitives-6.2", mode: "Value"});
@@ -545,6 +549,7 @@ async function generateCssPaletteFromVariabler( event: CodegenEvent): Promise<Co
   out += fixedCssContent;
   out += "} \n";
   out += "\n\n" + await generateCssPalette(event);
+  out += "\n" + await generateCssSizes({collectionName: "Color-categorical", cssPrefix: ".obc-categorical-color-", rootMode: "neutral"});
   out += extraCss;
 
   return [
