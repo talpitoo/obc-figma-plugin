@@ -319,7 +319,13 @@ async function followVariableReferences(
     }
 
 async function generateCssPalette(event: CodegenEvent): Promise<string> {
-  const variableModes = event.node.resolvedVariableModes;
+  // Deliberately not event.node.resolvedVariableModes. Reading the selection's
+  // modes made the same file export different CSS depending on what happened to
+  // be selected, and it hid the stale names in VariableModes for as long as the
+  // selection pinned those collections. The modes now come from VariableModes,
+  // then from the collection's default, so an export is reproducible.
+  const variableModes: Record<string, string> = {};
+  void event;
   const allVariables = await figma.variables.getLocalVariablesAsync();
   const collectionIds = allVariables.map((v) => v.variableCollectionId);
   const allCollections = await Promise.all(
