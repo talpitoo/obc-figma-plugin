@@ -29,9 +29,10 @@ const CLASS_EXPORTED_COLLECTIONS = new Set(["Color-categorical"]);
 // collection's default mode and is reported next to the generated CSS.
 const modeFallbacks = new Map<string, string>();
 const unresolvedTokens = new Map<string, number>();
-// CSS custom property -> the Figma variable names that produced it. Two names
-// on one property means the later declaration wins and the earlier value is
-// not in the file at all.
+// Block selector + CSS custom property -> the Figma variable names declared
+// under it. Two names on one property in one block means the later
+// declaration wins and the earlier value is not in the file at all; the same
+// property in two blocks is how a theme overrides a default, not a collision.
 const cssNameSources = new Map<string, Set<string>>();
 
 function resolveFallbackMode(collection: VariableCollection): { modeId: string; name: string } | undefined {
@@ -59,11 +60,12 @@ function generatorWarnings(): string {
   for (const [theme, count] of unresolvedTokens) {
     out += "Unresolved: " + count + " token(s) dropped from the " + theme + " block\n";
   }
-  for (const [cssName, sources] of cssNameSources) {
+  for (const [key, sources] of cssNameSources) {
     if (sources.size > 1) {
+      const [block, cssName] = key.split("\u0000");
       out +=
-        "Name collision on " + cssName + ": " + Array.from(sources).join(", ") +
-        " — only the last one survives\n";
+        "Name collision on " + cssName + " in " + block + ": " +
+        Array.from(sources).join(", ") + " — only the last one survives\n";
     }
   }
   if (out) {
@@ -117,9 +119,8 @@ function primitiveCssName(variable: Variable, collection: VariableCollection, bl
   return "--primitive-" + rename(parts.join("/")).slice(2);
 }
 
-// This provides the callback to generate the code.
-function rename(name: string): string {
-  const o = name
+function normaliseVariableName(name: string): string {
+  return name
     .toLowerCase()
     .replace(/\//g, "-")
     .replace(/ /g, "-")
@@ -129,34 +130,93 @@ function rename(name: string): string {
     .replace(/--/g, "-")
     .replace(/styles-/g, "")
     .replace(/integration-beta/g, "integration");
-  const parts = o.split("-");
+}
 
-  // Figma groups the text and icon colours as Color/On-<variant>/<role>-color,
-  // so dropping the leading "color" is the whole job. Anything between it and
-  // the On- segment is a family and part of the name: Automation/Symbol/On-…,
-  // Automation/Button/On-… and Automation/Connector/On-… are three different
-  // tokens, and collapsing them to --on-background-color left one value
-  // standing per theme.
+// The leading "color" says nothing a Palette token needs.
+function dropLeadingColor(o: string): string {
+  const parts = o.split("-");
   if (parts.length > 1 && parts[0] === "color") {
     parts.shift();
   }
   return "--" + parts.join("-");
 }
 
-// Only a declaration can lose a value to another one. A var() target and the
-// synthesised path primitiveCssName passes through rename() are not properties
-// the export declares, so recording them would report collisions the output
-// does not have.
-function recordDeclaration(cssName: string, figmaName: string): void {
-  const seen = cssNameSources.get(cssName);
-  if (seen) {
-    seen.add(figmaName);
-  } else {
-    cssNameSources.set(cssName, new Set([figmaName]));
+// Everything before the On- segment, dropped. Figma writes the same role two
+// ways — Color/On-alarm/Active-color, where the group is already the variant,
+// and Color/Alert/On-alarm-color, where it is a family — and the short name is
+// the published one for both.
+function collapseOnSegment(o: string): string {
+  const match = /^.*-on-(.*)$/.exec(o);
+  return match ? "on-" + match[1] : o;
+}
+
+// Which full names want each short name. Built from the file's own variables
+// before anything is generated, because the short name is only safe to use
+// when one variable asks for it.
+const onNameClaims = new Map<string, Set<string>>();
+
+async function buildOnNameClaims(): Promise<void> {
+  onNameClaims.clear();
+  for (const variable of await figma.variables.getLocalVariablesAsync()) {
+    const o = normaliseVariableName(variable.name);
+    const short = dropLeadingColor(collapseOnSegment(o));
+    const full = dropLeadingColor(o);
+    if (short === full) {
+      continue;
+    }
+    const claims = onNameClaims.get(short);
+    if (claims) {
+      claims.add(full);
+    } else {
+      onNameClaims.set(short, new Set([full]));
+    }
   }
 }
 
+// This provides the callback to generate the code.
+//
+// Collapsing to the short name is only correct while one variable claims it.
+// Color/Automation/{Button,Symbol,Connector}/On-background-color all claim
+// --on-background-color, so all three keep their family; Color/Alert/
+// On-alarm-color is alone on --on-alarm-color and keeps the short name it has
+// always published. The old integration special case falls out of the same
+// rule, since Color/On-selected/* claims what Color/Integration/On-selected-*
+// would collapse to.
+function rename(name: string): string {
+  const o = normaliseVariableName(name);
+  const short = dropLeadingColor(collapseOnSegment(o));
+  const full = dropLeadingColor(o);
+  if (short === full) {
+    return full;
+  }
+  // Integration mirrors the whole on-* family under its own prefix, so a
+  // member with no twin outside it (the -inactive- roles) must not fall
+  // through to the short name.
+  if (o.includes("-integration-")) {
+    return full;
+  }
+  return onNameClaims.get(short)?.size === 1 ? short : full;
+}
+
+// Called with the declaration text once it is known to be emitted. A var()
+// target, the synthesised path primitiveCssName passes through rename(), and
+// a variable that failed to resolve are not declarations the export carries,
+// so none of them is recorded.
+function recordDeclaration(block: string, cssName: string, figmaName: string, declaration: string): string {
+  if (declaration) {
+    const key = block + "\u0000" + cssName;
+    const seen = cssNameSources.get(key);
+    if (seen) {
+      seen.add(figmaName);
+    } else {
+      cssNameSources.set(key, new Set([figmaName]));
+    }
+  }
+  return declaration;
+}
+
 figma.codegen.on("generate", async (event) => {
+  await buildOnNameClaims();
   if (event.language === "variables") {
     return await generateColorVariableMap(event);
   } else if (event.language === "cssvariables") {
@@ -388,7 +448,7 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
     let declarations = "";
     for (const variable of palletteVariables) {
       const name = rename(variable.name);
-      recordDeclaration(name, variable.name);
+      const emit = (declaration: string) => recordDeclaration(cleanName, name, variable.name, declaration);
       const value = await followVariableReferences(variable.valuesByMode[mode.modeId], allVariables, allCollections, paletteCollection, mode, variableModes, true);
 
       if (value === null) {
@@ -405,11 +465,11 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
         const known = primitives.get(primitive);
         if (known !== undefined && known !== literal) {
           console.warn("Primitive name collision, emitting the literal", primitive, variable.name, mode.name);
-          declarations += "  " + name + ": " + literal + ";\n";
+          declarations += emit("  " + name + ": " + literal + ";\n");
           continue;
         }
         primitives.set(primitive, literal);
-        declarations += "  " + name + ": var(" + primitive + ");\n";
+        declarations += emit("  " + name + ": var(" + primitive + ");\n");
         continue;
       }
 
@@ -427,12 +487,12 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
       }
 
       if (!(value instanceof Object)) {
-        declarations += await value2str(value, name, allVariables);
+        declarations += emit(await value2str(value, name, allVariables));
         continue;
       }
       try {
         const color = rgbaToHexOrColorName(value as Color);
-        declarations += "  " + name + ": " + color + ";\n";
+        declarations += emit("  " + name + ": " + color + ";\n");
       } catch (e) {
         console.warn("Error converting color", variable.name, mode.name, value);
         continue;
@@ -475,9 +535,8 @@ async function generateCssSizes(options: {collectionName: string, cssPrefix: str
     out += options.cssPrefix + mode.name.toLowerCase() + " {\n";
     for (const variable of palletteVariables) {
       const name = rename(variable.name);
-      recordDeclaration(name, variable.name);
       const value = variable.valuesByMode[mode.modeId];
-      out += await value2str(value, name, allVariables);
+      out += recordDeclaration(options.cssPrefix + mode.name.toLowerCase(), name, variable.name, await value2str(value, name, allVariables));
     }
     out += "}\n";
   }
@@ -508,8 +567,7 @@ async function generateClassExportedBlocks(options: {collectionName: string, css
     out += (modeName === options.rootMode ? ":root, " : "") + classSelector + " {\n";
     for (const variable of ownVariables) {
       const ownName = rename(variable.name);
-      recordDeclaration(ownName, variable.name);
-      out += await value2str(variable.valuesByMode[mode.modeId], ownName, allVariables);
+      out += recordDeclaration(classSelector, ownName, variable.name, await value2str(variable.valuesByMode[mode.modeId], ownName, allVariables));
     }
     const scoped = new Map<string, string>();
     for (const [name, byTheme] of classExportedAliases) {
@@ -560,9 +618,8 @@ async function generateCssSizesFixedMode(options: {collectionName: string, mode:
   const mode = paletteCollection.modes.length > 1 ? paletteCollection.modes.find(m => m.name === options.mode)! : paletteCollection.modes[0];
   for (const variable of palletteVariables) {
     const name = rename(variable.name);
-    recordDeclaration(name, variable.name);
     const value = variable.valuesByMode[mode.modeId];
-    out += await value2str(value, name, allVariables);
+    out += recordDeclaration("*", name, variable.name, await value2str(value, name, allVariables));
   }
   
   return out;
@@ -694,8 +751,7 @@ async function generateDanglingAliasTargets(
       continue;
     }
     emittedNames.add(name);
-    recordDeclaration(name, variable.name);
-    out += await value2str(value, name, allVariables);
+    out += recordDeclaration("*", name, variable.name, await value2str(value, name, allVariables));
   }
   return out;
 }
