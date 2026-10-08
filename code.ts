@@ -29,6 +29,10 @@ const CLASS_EXPORTED_COLLECTIONS = new Set(["Color-categorical"]);
 // collection's default mode and is reported next to the generated CSS.
 const modeFallbacks = new Map<string, string>();
 const unresolvedTokens = new Map<string, number>();
+// CSS custom property -> the Figma variable names that produced it. Two names
+// on one property means the later declaration wins and the earlier value is
+// not in the file at all.
+const cssNameSources = new Map<string, Set<string>>();
 
 function resolveFallbackMode(collection: VariableCollection): { modeId: string; name: string } | undefined {
   const fallback = collection.modes.find((m) => m.modeId === collection.defaultModeId) ?? collection.modes[0];
@@ -54,6 +58,13 @@ function generatorWarnings(): string {
   }
   for (const [theme, count] of unresolvedTokens) {
     out += "Unresolved: " + count + " token(s) dropped from the " + theme + " block\n";
+  }
+  for (const [cssName, sources] of cssNameSources) {
+    if (sources.size > 1) {
+      out +=
+        "Name collision on " + cssName + ": " + Array.from(sources).join(", ") +
+        " — only the last one survives\n";
+    }
   }
   if (out) {
     out =
@@ -118,22 +129,25 @@ function rename(name: string): string {
     .replace(/--/g, "-")
     .replace(/styles-/g, "")
     .replace(/integration-beta/g, "integration");
-  const hasOnRegex = /^.*-on-(.*)$/;
-  const hasIntegrationRegex = /^.*-integration-(.*)$/;
-  if (hasOnRegex.test(o) && !hasIntegrationRegex.test(o)) {
-    const match = hasOnRegex.exec(o);
-    if (match) {
-      o = "on-" + match[1];
-    }
-  }
-
   const parts = o.split("-");
-  
 
+  // Figma groups the text and icon colours as Color/On-<variant>/<role>-color,
+  // so dropping the leading "color" is the whole job. Anything between it and
+  // the On- segment is a family and part of the name: Automation/Symbol/On-…,
+  // Automation/Button/On-… and Automation/Connector/On-… are three different
+  // tokens, and collapsing them to --on-background-color left one value
+  // standing per theme.
   if (parts.length > 1 && parts[0] === "color") {
     parts.shift();
   }
-  return "--" + parts.join("-");
+  const cssName = "--" + parts.join("-");
+  const seen = cssNameSources.get(cssName);
+  if (seen) {
+    seen.add(name);
+  } else {
+    cssNameSources.set(cssName, new Set([name]));
+  }
+  return cssName;
 }
 
 figma.codegen.on("generate", async (event) => {
@@ -717,6 +731,7 @@ async function generateCssPaletteFromVariabler( event: CodegenEvent): Promise<Co
   classExportedAliases.clear();
   modeFallbacks.clear();
   unresolvedTokens.clear();
+  cssNameSources.clear();
   let out = await generateCssSizes({collectionName: "Component-size", cssPrefix: ".obc-component-size-", rootMode: "regular"});
   out += "* {\n";
   out += await generateCssSizesFixedMode({collectionName: ".typography-primitives", mode: "Regular"});
