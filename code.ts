@@ -157,7 +157,10 @@ const onNameClaims = new Map<string, Set<string>>();
 
 async function buildOnNameClaims(): Promise<void> {
   onNameClaims.clear();
-  for (const variable of await figma.variables.getLocalVariablesAsync()) {
+  // Awaited into a local first: QuickJS cannot compile `for (... of yield ...)`,
+  // which is what an inline await becomes at this target.
+  const variables = await figma.variables.getLocalVariablesAsync();
+  for (const variable of variables) {
     const o = normaliseVariableName(variable.name);
     const short = dropLeadingColor(collapseOnSegment(o));
     const full = dropLeadingColor(o);
