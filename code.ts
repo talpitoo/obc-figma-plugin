@@ -164,9 +164,8 @@ async function buildOnNameClaims(): Promise<void> {
     const o = normaliseVariableName(variable.name);
     const short = dropLeadingColor(collapseOnSegment(o));
     const full = dropLeadingColor(o);
-    if (short === full) {
-      continue;
-    }
+    // A variable that already carries the short name claims it too, or a
+    // family-prefixed sibling would see itself alone and collapse onto it.
     const claims = onNameClaims.get(short);
     if (claims) {
       claims.add(full);
