@@ -119,7 +119,7 @@ function primitiveCssName(variable: Variable, collection: VariableCollection, bl
 
 // This provides the callback to generate the code.
 function rename(name: string): string {
-  let o = name
+  const o = name
     .toLowerCase()
     .replace(/\//g, "-")
     .replace(/ /g, "-")
@@ -140,14 +140,20 @@ function rename(name: string): string {
   if (parts.length > 1 && parts[0] === "color") {
     parts.shift();
   }
-  const cssName = "--" + parts.join("-");
+  return "--" + parts.join("-");
+}
+
+// Only a declaration can lose a value to another one. A var() target and the
+// synthesised path primitiveCssName passes through rename() are not properties
+// the export declares, so recording them would report collisions the output
+// does not have.
+function recordDeclaration(cssName: string, figmaName: string): void {
   const seen = cssNameSources.get(cssName);
   if (seen) {
-    seen.add(name);
+    seen.add(figmaName);
   } else {
-    cssNameSources.set(cssName, new Set([name]));
+    cssNameSources.set(cssName, new Set([figmaName]));
   }
-  return cssName;
 }
 
 figma.codegen.on("generate", async (event) => {
@@ -382,6 +388,7 @@ async function generateCssPalette(event: CodegenEvent): Promise<string> {
     let declarations = "";
     for (const variable of palletteVariables) {
       const name = rename(variable.name);
+      recordDeclaration(name, variable.name);
       const value = await followVariableReferences(variable.valuesByMode[mode.modeId], allVariables, allCollections, paletteCollection, mode, variableModes, true);
 
       if (value === null) {
@@ -468,6 +475,7 @@ async function generateCssSizes(options: {collectionName: string, cssPrefix: str
     out += options.cssPrefix + mode.name.toLowerCase() + " {\n";
     for (const variable of palletteVariables) {
       const name = rename(variable.name);
+      recordDeclaration(name, variable.name);
       const value = variable.valuesByMode[mode.modeId];
       out += await value2str(value, name, allVariables);
     }
@@ -499,7 +507,9 @@ async function generateClassExportedBlocks(options: {collectionName: string, css
     const classSelector = options.cssPrefix + modeName;
     out += (modeName === options.rootMode ? ":root, " : "") + classSelector + " {\n";
     for (const variable of ownVariables) {
-      out += await value2str(variable.valuesByMode[mode.modeId], rename(variable.name), allVariables);
+      const ownName = rename(variable.name);
+      recordDeclaration(ownName, variable.name);
+      out += await value2str(variable.valuesByMode[mode.modeId], ownName, allVariables);
     }
     const scoped = new Map<string, string>();
     for (const [name, byTheme] of classExportedAliases) {
@@ -550,6 +560,7 @@ async function generateCssSizesFixedMode(options: {collectionName: string, mode:
   const mode = paletteCollection.modes.length > 1 ? paletteCollection.modes.find(m => m.name === options.mode)! : paletteCollection.modes[0];
   for (const variable of palletteVariables) {
     const name = rename(variable.name);
+    recordDeclaration(name, variable.name);
     const value = variable.valuesByMode[mode.modeId];
     out += await value2str(value, name, allVariables);
   }
@@ -683,6 +694,7 @@ async function generateDanglingAliasTargets(
       continue;
     }
     emittedNames.add(name);
+    recordDeclaration(name, variable.name);
     out += await value2str(value, name, allVariables);
   }
   return out;
